@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "address": {"type": "string"},
+    "venue_name": {"type": "string"},
+    "confidence": {"type": "string", "enum": ["high", "venue_only", "none", "online"]}
+  },
+  "required": ["address", "venue_name", "confidence"]
+}

@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "properties": {
+    "registration_required": {"type": "string", "enum": ["ja", "nein", "unbekannt"]},
+    "evidence": {"type": "string"}
+  },
+  "required": ["registration_required", "evidence"]
+}

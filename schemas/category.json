@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "category": {
+      "type": "string",
+      "enum": ["workshop", "demo", "talk", "meetup", "kultur", "sonstiges"]
+    },
+    "evidence": {"type": "string"}
+  },
+  "required": ["category", "evidence"]
+}

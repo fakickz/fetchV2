@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "end_date": {"type": "string"},
+    "end_time": {"type": "string"},
+    "evidence_end_date": {"type": "string"},
+    "evidence_end_time": {"type": "string"}
+  },
+  "required": ["end_date", "end_time", "evidence_end_date", "evidence_end_time"]
+}

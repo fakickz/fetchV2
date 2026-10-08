@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "language": {"type": "string", "enum": ["de", "en", "other", "unknown"]},
+    "language_name": {"type": "string"},
+    "evidence": {"type": "string"}
+  },
+  "required": ["language", "language_name", "evidence"]
+}

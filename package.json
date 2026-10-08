@@ -1,0 +1,16 @@
+{
+  "name": "fetchv2",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "fetch": ".venv/bin/python scripts/fetch.py --mode overviews",
+    "fetch:details": ".venv/bin/python scripts/fetch.py --mode urls",
+    "api-gate": ".venv/bin/python scripts/api_gate.py",
+    "discover": ".venv/bin/python scripts/discover.py",
+    "basis": ".venv/bin/python scripts/basis.py",
+    "detail": ".venv/bin/python scripts/detail.py",
+    "test": ".venv/bin/python -m unittest tests.test_pipeline_v2",
+    "v2": "npm run fetch && npm run api-gate && npm run discover && npm run fetch:details && npm run basis && npm run detail"
+  }
+}
