@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,12 @@ from progress import Progress, load_or_start_run, record_step
 
 OUT_DISCOVERY = ev.OUT_DIR / "discovery.json"
 API_SOURCES = ev.OUT_DIR / "api_sources.json"
+DISCOVER_TEXT_CAP = 24000
+_ARCHIVE_TITLE_RE = re.compile(
+    r"^monatsprogramm(?:\s+\d{1,2}(?:/\d{2,4})?|"
+    r"\s+[a-zäöü]+(?:\s+\d{4})?)?$",
+    re.IGNORECASE,
+)
 
 
 def load_api_sources(path: Path | None = None) -> dict[str, Any]:
@@ -37,16 +44,31 @@ def load_api_sources(path: Path | None = None) -> dict[str, Any]:
     return sources if isinstance(sources, dict) else {}
 
 
-def normalize_event(source_url: str, raw: dict[str, Any]) -> dict[str, str] | None:
+def normalize_event(
+    source_url: str,
+    raw: dict[str, Any],
+    page_links: list[dict[str, Any]] | None = None,
+) -> dict[str, str] | None:
     title = _flat(str(raw.get("title") or ""))
     if not title:
+        return None
+    if _ARCHIVE_TITLE_RE.fullmatch(title):
         return None
     href = _flat(str(raw.get("url") or ""))
     event_url = ""
     if href and not href.startswith("#"):
         candidate = ev.absolute_url(source_url, href)
         if ev.is_http_url(candidate) and not ev.same_page_link(candidate, source_url):
-            event_url = ev.norm_url(candidate)
+            candidate = ev.norm_url(candidate)
+            if page_links is None:
+                event_url = candidate
+            else:
+                known_urls = {
+                    ev.norm_url(str(link.get("href") or "")).lower()
+                    for link in page_links if isinstance(link, dict)
+                }
+                if candidate.lower() in known_urls:
+                    event_url = candidate
     return {
         "title": title[:300],
         "event_url": event_url,
@@ -118,7 +140,7 @@ async def discover_source(
             payload = {
                 "source_url": url,
                 "orga": source.get("orga", ""),
-                "source_text": text[:ev.TEXT_CAP],
+                "source_text": text[:DISCOVER_TEXT_CAP],
                 "page_links": link_index(page, url),
             }
             data, errors = await ev.llm_json(
@@ -134,7 +156,9 @@ async def discover_source(
                     for item in raw_events:
                         if not isinstance(item, dict):
                             continue
-                        normalized = normalize_event(url, item)
+                        links = page.get("links")
+                        normalized = normalize_event(
+                            url, item, links if isinstance(links, list) else [])
                         if normalized:
                             events.append({**normalized, "orga_id": source.get("orga_id", ""),
                                             "orga": source.get("orga", ""), "source_url": url})

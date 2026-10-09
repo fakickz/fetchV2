@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """fetch: Seiten in den Corpus laden. Kein LLM, kein Urteil, keine Extraktion.
 
-Der Corpus ist der Cache der Pipeline. Er wird einmal gefüllt und danach von
-discover/basis/detail gelesen, sodass Prompts und Modelle beliebig oft neu
-ausprobiert werden können, ohne je wieder ins Netz zu müssen.
+Jeder reguläre Lauf crawlt seine ausgewählten Ziele frisch und aktualisiert
+den Corpus. Nachfolgende Stufen lesen diesen Snapshot, sodass Prompts und
+Modelle beliebig oft neu ausprobiert werden können, ohne erneut zu crawlen.
 
 Modi:
   --mode overviews   INPUT/sources.csv  -> Übersichtsseiten, kind=overview
@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -39,12 +41,118 @@ from progress import Progress, load_or_start_run, record_step, start_run
 
 OUT_DISCOVERY = ev.OUT_DIR / "discovery.json"
 
+# Consent UI observed in the stored corpus. Keep selectors provider-specific so
+# ordinary event content mentioning cookies is not removed.
+MARKDOWN_EXCLUDED_SELECTOR = (
+    ".jelka-consent, #cmplz-cookiebanner-container, #cmplz-manage-consent, "
+    ".cky-consent-container, .cky-preference-center, .cky-btn-revisit-wrapper"
+)
+
+
+class CorpusStage:
+    """Isolierter Corpus-Schreibstand mit Commit- oder Rollback-Verhalten."""
+
+    def __init__(self) -> None:
+        self.pages_dir = ev.PAGES_DIR
+        self.pages_index = ev.PAGES_INDEX
+        self.readable_dir = ev.readable_dir()
+        self.root: Path | None = None
+        self.stage_pages: Path | None = None
+        self.stage_readable: Path | None = None
+        self._preserve_root = False
+
+    def __enter__(self) -> "CorpusStage":
+        self.root = Path(tempfile.mkdtemp(
+            prefix=".fetch-corpus-", dir=self.pages_dir.parent))
+        self.stage_pages = self.root / "pages"
+        self.stage_readable = self.root / "pages_readable"
+        try:
+            if self.pages_dir.exists():
+                shutil.copytree(self.pages_dir, self.stage_pages)
+            else:
+                self.stage_pages.mkdir(parents=True)
+            if self.readable_dir.exists():
+                shutil.copytree(self.readable_dir, self.stage_readable)
+            else:
+                self.stage_readable.mkdir(parents=True)
+        except Exception:
+            shutil.rmtree(self.root)
+            self.root = None
+            raise
+        ev.PAGES_DIR = self.stage_pages
+        ev.PAGES_INDEX = self.stage_pages / "index.json"
+        return self
+
+    def prune_kind(self, kind: str, keep_urls: set[str]) -> int:
+        index = ev.load_index()
+        removed = 0
+        for url, entry in list(index.items()):
+            if not isinstance(entry, dict) or entry.get("kind") != kind:
+                continue
+            if ev.norm_url(url) in keep_urls:
+                continue
+            ev.page_path(url).unlink(missing_ok=True)
+            del index[url]
+            removed += 1
+        ev.save_index(index)
+        return removed
+
+    def publish(
+        self,
+        update_readable: bool,
+        sources_path: Path,
+        discovery_path: Path,
+    ) -> None:
+        if self.root is None or self.stage_pages is None or self.stage_readable is None:
+            raise RuntimeError("CorpusStage wurde nicht gestartet")
+        if update_readable:
+            rebuild_readable(sources_path, discovery_path)
+
+        backup_pages = self.root / "pages.previous"
+        backup_readable = self.root / "pages_readable.previous"
+        moved_pages = moved_readable = installed_pages = installed_readable = False
+        try:
+            if self.pages_dir.exists():
+                os.replace(self.pages_dir, backup_pages)
+                moved_pages = True
+            if update_readable and self.readable_dir.exists():
+                os.replace(self.readable_dir, backup_readable)
+                moved_readable = True
+            os.replace(self.stage_pages, self.pages_dir)
+            installed_pages = True
+            if update_readable:
+                os.replace(self.stage_readable, self.readable_dir)
+                installed_readable = True
+        except Exception:
+            try:
+                if installed_readable and self.readable_dir.exists():
+                    os.replace(self.readable_dir, self.stage_readable)
+                if installed_pages and self.pages_dir.exists():
+                    os.replace(self.pages_dir, self.stage_pages)
+                if moved_readable and backup_readable.exists():
+                    os.replace(backup_readable, self.readable_dir)
+                if moved_pages and backup_pages.exists():
+                    os.replace(backup_pages, self.pages_dir)
+            except Exception as rollback_error:
+                self._preserve_root = True
+                raise RuntimeError(
+                    f"Corpus-Rollback fehlgeschlagen; Sicherung bleibt unter {self.root}"
+                ) from rollback_error
+            raise
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        ev.PAGES_DIR = self.pages_dir
+        ev.PAGES_INDEX = self.pages_index
+        if self.root is not None and not self._preserve_root:
+            shutil.rmtree(self.root)
+
 
 def build_run_config(scroll_steps: int, scroll_delay: float, timeout: int) -> CrawlerRunConfig:
     return CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
         verbose=False,
         word_count_threshold=1,
+        excluded_selector=MARKDOWN_EXCLUDED_SELECTOR,
         page_timeout=timeout,
         scan_full_page=True,
         scroll_delay=scroll_delay,
@@ -106,16 +214,36 @@ def orga_lookup(sources_path: Path, discovery_path: Path) -> dict[str, dict[str,
     return mapping
 
 
-def already_fetched(url: str, refresh: bool, retry_failed: bool) -> bool:
-    if refresh:
-        return False
-    record = ev.load_index().get(ev.norm_url(url))
-    if not record:
-        return False
-    status = str(record.get("status") or "")
-    if retry_failed:
-        return status == "ok"
-    return True
+def targets_to_fetch(targets: list[dict[str, str]], retry_failed: bool) -> list[dict[str, str]]:
+    """Normale Läufe crawlen alle Ziele; retry-failed ist ein expliziter Teillauf."""
+    if not retry_failed:
+        return targets
+    index = ev.load_index()
+    pending: list[dict[str, str]] = []
+    for target in targets:
+        entry = index.get(ev.norm_url(target["url"]))
+        if (not isinstance(entry, dict) or entry.get("status") != "ok"
+                or entry.get("last_fetch_error")):
+            pending.append(target)
+    return pending
+
+
+def save_fetch_failure(
+    record: dict[str, Any],
+    message: str,
+    readable: bool,
+    status: str = "error",
+) -> dict[str, Any]:
+    """Einen Crawlfehler protokollieren, ohne einen guten Corpusstand zu verlieren."""
+    previous = ev.load_page(record["url"])
+    if previous and previous.get("status") == "ok":
+        previous["last_fetch_attempt_at"] = ev.now_iso()
+        previous["last_fetch_error"] = message
+        ev.save_page(previous, readable=readable)
+        return {**record, "status": status, "error": message}
+    record.update(status=status, error=message, fetched_at=ev.now_iso())
+    ev.save_page(record, readable=readable)
+    return record
 
 
 async def fetch_one(
@@ -131,15 +259,12 @@ async def fetch_one(
         try:
             result = await crawler.arun(url=url, config=config)
         except Exception as exc:
-            record.update(status="error", error=f"{type(exc).__name__}: {exc}"[:400])
-            ev.save_page(record, readable=readable)
-            return record
+            return save_fetch_failure(
+                record, f"{type(exc).__name__}: {exc}"[:400], readable)
     html = str(getattr(result, "html", "") or "")
     if not getattr(result, "success", False) or not html.strip():
         message = getattr(result, "error_message", None) or "kein HTML"
-        record.update(status="error", error=str(message)[:400])
-        ev.save_page(record, readable=readable)
-        return record
+        return save_fetch_failure(record, str(message)[:400], readable)
     metadata = getattr(result, "metadata", None)
     page_title = str(metadata.get("title") or "")[:300] if isinstance(metadata, dict) else ""
     record.update(
@@ -155,7 +280,8 @@ async def fetch_one(
         title=page_title,
     )
     if not record["markdown"] and not record["text"]:
-        record.update(status="empty", error="Seite ohne lesbaren Text")
+        return save_fetch_failure(record, "Seite ohne lesbaren Text",
+                                  readable, status="empty")
     ev.save_page(record, readable=readable)
     return record
 
@@ -254,7 +380,7 @@ async def run(args: argparse.Namespace) -> int:
         print("Keine Ziele gefunden.", flush=True)
         return 1
 
-    pending = [t for t in targets if not already_fetched(t["url"], args.refresh, args.retry_failed)]
+    pending = targets_to_fetch(targets, args.retry_failed)
     skipped = len(targets) - len(pending)
     # Der Übersichts-Durchlauf ist der Kopf der Pipeline und eröffnet die
     # Gesamtuhr; die Folgestufen (und --mode urls) hängen sich daran. Ohne das
@@ -273,30 +399,47 @@ async def run(args: argparse.Namespace) -> int:
     semaphore = asyncio.Semaphore(max(1, args.jobs))
     counts = {"ok": 0, "error": 0, "empty": 0}
 
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        async def worker(target: dict[str, str]) -> None:
-            unit_started = time.monotonic()
-            try:
-                record = await fetch_one(crawler, target, config, semaphore, not args.no_readable)
-            except Exception as exc:  # ein Ausfall darf den Batch nicht stoppen
-                record = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
-            status = str(record.get("status", "error"))
-            counts[status] = counts.get(status, 0) + 1
-            tracker.update(sum(counts.values()), time.monotonic() - unit_started)
+    with CorpusStage() as staged:
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            async def worker(target: dict[str, str]) -> None:
+                unit_started = time.monotonic()
+                try:
+                    record = await fetch_one(
+                        crawler, target, config, semaphore, not args.no_readable)
+                except Exception as exc:  # ein Ausfall darf den Batch nicht stoppen
+                    record = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                status = str(record.get("status", "error"))
+                counts[status] = counts.get(status, 0) + 1
+                tracker.update(sum(counts.values()), time.monotonic() - unit_started)
 
-        await asyncio.gather(*(worker(target) for target in pending))
+            await asyncio.gather(*(worker(target) for target in pending))
+
+        complete = counts.get("error", 0) == 0 and counts.get("empty", 0) == 0
+        if complete:
+            full_run = args.limit == 0 and not args.retry_failed
+            if full_run:
+                keep_urls = {ev.norm_url(target["url"]) for target in targets}
+                kind = "overview" if args.mode == "overviews" else "detail"
+                removed = staged.prune_kind(kind, keep_urls)
+                if removed:
+                    print(f"Veraltete {kind}-Seiten entfernt: {removed}", flush=True)
+            staged.publish(
+                update_readable=not args.no_readable,
+                sources_path=Path(args.input),
+                discovery_path=Path(args.urls_from),
+            )
 
     tracker.finish()
     record_step(state, f"fetch_{args.mode}", time.monotonic() - started)
     print(f"Fetch fertig: ok {counts.get('ok', 0)} / leer {counts.get('empty', 0)} "
           f"/ Fehler {counts.get('error', 0)}", flush=True)
-    if counts.get("error"):
-        print("Fehlerhafte Seiten bleiben im Corpus (status=error) und können mit "
-              "--retry-failed erneut geholt werden.", flush=True)
+    if not complete:
+        print("Fehlgeschlagene Abrufe können mit --retry-failed erneut geholt werden; "
+              "der bisherige Corpus bleibt unverändert.", flush=True)
     if not args.no_readable:
         run_summary(targets, ev.load_index())
         print(f"Spiegel: {ev.readable_dir()}", flush=True)
-    return 0
+    return 0 if complete else 1
 
 
 def main() -> None:
@@ -306,8 +449,10 @@ def main() -> None:
     parser.add_argument("--urls-from", default=str(OUT_DISCOVERY), help="discovery.json für --mode urls")
     parser.add_argument("--jobs", type=int, default=4, help="parallele Seitenabrufe")
     parser.add_argument("--limit", type=int, default=0, help="max. Ziele (0 = alle)")
-    parser.add_argument("--refresh", action="store_true", help="Corpus ignorieren und neu laden")
-    parser.add_argument("--retry-failed", action="store_true", help="nur nicht-ok Seiten neu laden")
+    parser.add_argument("--refresh", action="store_true",
+                        help="kompatibler Alt-Parameter; normale Läufe crawlen immer frisch")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="nur Ziele ohne erfolgreichen letzten Abruf neu laden")
     parser.add_argument("--no-readable", action="store_true", help="kein lesbares Spiegel schreiben")
     parser.add_argument("--readable-only", action="store_true",
                         help="nur Spiegel aus dem vorhandenen Corpus aufbauen, kein Netz")
