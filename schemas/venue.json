@@ -2,8 +2,9 @@
   "type": "object",
   "properties": {
     "address": {"type": "string"},
+    "address_source": {"type": "string", "enum": ["page", "inferred", ""]},
     "venue_name": {"type": "string"},
     "confidence": {"type": "string", "enum": ["high", "venue_only", "none", "online"]}
   },
-  "required": ["address", "venue_name", "confidence"]
+  "required": ["address", "address_source", "venue_name", "confidence"]
 }

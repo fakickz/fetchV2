@@ -13,7 +13,7 @@ import json
 import os
 import re
 import unicodedata
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from html import unescape
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ from llm import ClientRouter, is_openrouter_model, reasoning_kwargs, require_api
 
 ROOT = Path(__file__).resolve().parent.parent
 PROMPTS_DIR = ROOT / "prompts"
+CONFIG_DIR = ROOT / "config"
 SCHEMAS_DIR = ROOT / "schemas"
 INPUT_DIR = ROOT / "INPUT"
 OUT_DIR = ROOT / "out"
@@ -41,7 +42,6 @@ VIENNA = ZoneInfo("Europe/Vienna")
 
 load_dotenv(ROOT / ".env")
 
-TEXT_CAP = 24000
 SECTION_CAP = 6000
 MAX_LINKS = 600
 RETRYABLE = ("429", "ratelimit", "rate_limit", "500", "502", "503", "504",
@@ -476,6 +476,9 @@ def save_page(record: dict[str, Any], readable: bool = True) -> None:
         "status": record.get("status", ""),
         "fetched_at": record.get("fetched_at", ""),
     }
+    for key in ("last_fetch_attempt_at", "last_fetch_error"):
+        if record.get(key):
+            entry[key] = record[key]
     if readable:
         taken = {str(item.get("readable")): owner
                  for owner, item in index.items()
@@ -483,6 +486,10 @@ def save_page(record: dict[str, Any], readable: bool = True) -> None:
         rel = resolve_readable(readable_rel_path(record), url, taken)
         write_readable(record, rel)
         entry["readable"] = rel
+    elif record.get("last_fetch_error"):
+        previous = index.get(url)
+        if isinstance(previous, dict) and previous.get("readable"):
+            entry["readable"] = previous["readable"]
     index[url] = entry
     save_index(index)
 
@@ -599,6 +606,10 @@ def iso_date(value: Any) -> date | None:
         return None
 
 
+def current_date() -> date:
+    return datetime.now(VIENNA).date()
+
+
 def is_past(start_date: str, today: date | None = None) -> bool | None:
     """True/False bei gesichertem Datum, None wenn nicht beurteilbar.
 
@@ -608,11 +619,11 @@ def is_past(start_date: str, today: date | None = None) -> bool | None:
     parsed = iso_date(start_date)
     if parsed is None:
         return None
-    return parsed < (today or datetime.now(VIENNA).date())
+    return parsed < (today if today is not None else current_date())
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(VIENNA).isoformat(timespec="seconds")
 
 
 # --------------------------------------------------------------------------
@@ -794,6 +805,20 @@ def load_prompt(name: str) -> str:
     if not prompt:
         raise ValueError(f"Prompt ist leer: {path}")
     return prompt
+
+
+def load_input_config() -> dict[str, Any]:
+    """config/input.json: Eingabequelle je Schritt. Fehlende Datei = Defaults."""
+    path = CONFIG_DIR / "input.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Config ist kein gültiges JSON: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Config ist kein Objekt: {path}")
+    return data
 
 
 def load_schema(name: str) -> dict[str, Any]:
@@ -1065,50 +1090,101 @@ def _csv_cell(value: Any) -> str:
 # Textauswahl pro Event
 # --------------------------------------------------------------------------
 
-def page_text(page: dict[str, Any] | None) -> str:
-    """Lesetext einer Corpus-Seite: bereinigt zuerst, Original als Fallback.
+TEXT_SOURCES = {"raw": "markdown", "content": "content_markdown"}
 
-    Alte Corpus-Einträge ohne content_markdown fallen automatisch auf markdown
-    zurück — kein Re-Crawl nötig.
+
+def page_text(page: dict[str, Any] | None, source: str = "raw") -> str:
+    """Lesetext einer Corpus-Seite. raw = Crawl-Markdown, content = DOM-bereinigt.
+
+    Kein stilles Fallback zwischen den Fassungen: leer bleibt leer.
     """
     if not isinstance(page, dict):
         return ""
-    return str(page.get("content_markdown")
-               or page.get("markdown") or page.get("text") or "").strip()
+    return str(page.get(TEXT_SOURCES[source]) or "").strip()
 
 
 _HEADING_RE = re.compile(r"^#{1,4}\s", re.MULTILINE)
+_LISTING_DATE_LINE_RE = re.compile(
+    r"^(?:(?:heute|morgen|übermorgen|diese woche|nächste woche)\b|"
+    r"(?:mo|di|mi|do|fr|sa|so)\.?\s+\d{1,2}\b|"
+    r"\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b|"
+    r"(?:jan(?:uar)?|feb(?:ruar)?|märz|mar|apr(?:il)?|mai|jun(?:i)?|"
+    r"jul(?:i)?|aug(?:ust)?|sep(?:t(?:ember)?)?|okt(?:ober)?|nov(?:ember)?|"
+    r"dez(?:ember)?|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|"
+    r"may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}\b)",
+    re.IGNORECASE,
+)
 
 
-def cut_section(text: str, locator: str, cap: int = SECTION_CAP) -> str:
+def cut_section(text: str, locator: str, cap: int = SECTION_CAP,
+                title: str = "") -> str:
     """Abschnitt um einen Locator herum, für Events ohne eigene Detailseite.
 
     Der Locator stammt aus einem unverifizierten Listing-Pass; er dient nur
-    dazu, die Stelle im Übersichtstext zu finden. Kein Treffer => ganzer Text.
+    dazu, die Stelle im Übersichtstext zu finden. Der optionale Titel ist
+    ebenfalls nur ein Locator und hilft, wenn das Datum vor der Event-Überschrift
+    steht. Kein Treffer => ganzer Text.
     """
     if not text:
         return ""
-    needle = normalize_quote(locator)
-    if not needle:
+    lines = text.splitlines(keepends=True)
+
+    def matching_lines(value: str) -> list[int]:
+        needle = normalize_quote(value)
+        if not needle:
+            return []
+        return [i for i, line in enumerate(lines) if needle in normalize_quote(line)]
+
+    locator_lines = matching_lines(locator)
+    title_lines = matching_lines(title)
+    locator_line = locator_lines[0] if locator_lines else None
+    title_line = None
+    if title_lines:
+        if locator_line is None:
+            title_line = title_lines[0]
+        else:
+            after_locator = [line for line in title_lines if line >= locator_line]
+            title_line = after_locator[0] if after_locator else title_lines[-1]
+    if locator_line is None and title_line is None:
         return text[:cap].strip()
-    hay = normalize_quote(text)
-    index = hay.find(needle)
-    if index < 0:
-        return text[:cap].strip()
-    start = text.rfind("\n", 0, index)
-    start = 0 if start < 0 else start + 1
-    window = text[start:]
-    # Die Zeile, in der der Locator steht, gehört zum Abschnitt (sie ist oft
-    # selbst die Event-Überschrift). Erst ab der nächsten Zeile schneiden.
-    first_line = window.find("\n")
-    offset = 0 if first_line < 0 else first_line + 1
-    ends = [m.start() for m in _HEADING_RE.finditer(window) if m.start() >= offset]
-    cut = min(ends) if ends else len(window)
-    section = window[:cut].strip()
-    return (section or window[:cap].strip())[:cap].strip()
+
+    start_line = min(line for line in (locator_line, title_line) if line is not None)
+    headings = [i for i, line in enumerate(lines) if _HEADING_RE.match(line)]
+    if title_line is not None:
+        event_heading = title_line
+    else:
+        later_headings = [line for line in headings if line > start_line]
+        event_heading = None
+        locator_is_standalone = (
+            locator_line is not None
+            and normalize_quote(lines[locator_line]) == normalize_quote(locator)
+        )
+        if later_headings and locator_is_standalone:
+            candidate = later_headings[0]
+            between = lines[start_line + 1:candidate]
+            if all(not line.strip() for line in between):
+                event_heading = candidate
+
+    end_line = len(lines)
+    if event_heading is not None:
+        later_headings = [line for line in headings if line > event_heading]
+        if later_headings:
+            end_line = later_headings[0]
+        for i in range(event_heading + 1, end_line):
+            if _LISTING_DATE_LINE_RE.match(lines[i].strip()):
+                end_line = i
+                break
+    else:
+        later_headings = [line for line in headings if line > start_line]
+        if later_headings:
+            end_line = later_headings[0]
+
+    section = "".join(lines[start_line:end_line]).strip()
+    return (section or "".join(lines[start_line:])).strip()[:cap].strip()
 
 
-def event_text(event: dict[str, Any], *, cap: int = TEXT_CAP) -> tuple[str, str]:
+def event_text(event: dict[str, Any], source: str = "raw") -> tuple[str, str]:
     """Lesematerial + Herkunft. Detailseite > Übersicht (auf Abschnitt gekürzt).
 
     Discovery-Ergebnisse werden nie als Fakt behandelt: title/listed_date_text
@@ -1118,18 +1194,22 @@ def event_text(event: dict[str, Any], *, cap: int = TEXT_CAP) -> tuple[str, str]
     if detail_url:
         page = load_page(detail_url)
         if page and page.get("status") == "ok":
-            text = page_text(page)
+            text = page_text(page, source)
             if text:
-                return text[:cap].strip(), "detail"
+                return text, "detail"
     overview_url = str(event.get("source_url") or "").strip()
     if overview_url:
         page = load_page(overview_url)
         if page and page.get("status") == "ok":
-            full = page_text(page)
+            full = page_text(page, source)
             if full:
-                if detail_url or not str(event.get("listed_date_text") or "").strip():
-                    return full[:cap].strip(), "overview"
-                return cut_section(full, str(event.get("listed_date_text") or "")), "overview_cut"
+                if detail_url:
+                    return full, "overview"
+                locator = str(event.get("listed_date_text") or "")
+                title = str(event.get("title") or "")
+                if locator or title:
+                    return cut_section(full, locator, title=title), "overview_cut"
+                return full, "overview"
     return "", "none"
 
 

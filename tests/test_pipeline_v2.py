@@ -164,7 +164,7 @@ class SchemaTests(unittest.TestCase):
 
     def test_validate_schema_accepts_full_object(self):
         schema = ev.load_schema("venue")
-        ok = {"address": "", "venue_name": "", "confidence": "none"}
+        ok = {"address": "", "address_source": "", "venue_name": "", "confidence": "none"}
         self.assertEqual(ev.validate_schema(ok, schema), [])
 
     def test_validate_schema_array_items(self):
@@ -344,6 +344,23 @@ class CutSectionTests(unittest.TestCase):
         text = "Vorspann\nAm 23.08.2026 Konzert.\n## Nächstes\nanderer text"
         self.assertEqual(ev.cut_section(text, "23.08.2026"), "Am 23.08.2026 Konzert.")
 
+    def test_date_before_heading_keeps_event_title_and_description(self):
+        text = (
+            "Heute, 18:45\n"
+            "## Linkswende kennenlernen & aktiv werden\n"
+            "Im Oktober stehen jede Menge Proteste an.\n"
+            "Morgen, 12:00\n"
+            "## Schulstreik gegen das Kopftuchverbot\n"
+            "Der nächste Eventtext."
+        )
+        section = ev.cut_section(
+            text, "Heute, 18:45", title="Linkswende kennenlernen & aktiv werden")
+        self.assertIn("Heute, 18:45", section)
+        self.assertIn("## Linkswende kennenlernen & aktiv werden", section)
+        self.assertIn("Im Oktober stehen jede Menge Proteste an.", section)
+        self.assertNotIn("Morgen, 12:00", section)
+        self.assertNotIn("Schulstreik", section)
+
     def test_missing_locator_returns_head_of_text(self):
         self.assertEqual(ev.cut_section("ganz was anderes", "23.08.2026"), "ganz was anderes")
 
@@ -444,6 +461,31 @@ class ReadableMirrorTests(unittest.TestCase):
         ev.save_page(self._record(), readable=False)
         self.assertFalse(any((ev.readable_dir()).rglob("*.json")))
         self.assertNotIn("readable", ev.load_index()["https://a.org/e1"])
+
+    def test_readable_false_does_not_keep_stale_index_reference(self):
+        ev.save_page(self._record())
+        updated = self._record()
+        updated["markdown"] = "# Updated"
+        ev.save_page(updated, readable=False)
+        self.assertNotIn("readable", ev.load_index()["https://a.org/e1"])
+
+    def test_failed_refresh_keeps_last_good_corpus(self):
+        previous = self._record()
+        ev.save_page(previous)
+        attempted = ev.new_page_record(previous["url"], "detail", "Jelka", "3c8373bd-1")
+        result = fetch.save_fetch_failure(attempted, "Timeout", readable=False)
+        saved = ev.load_page(previous["url"])
+        entry = ev.load_index()[previous["url"]]
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(saved["status"], "ok")
+        self.assertEqual(saved["html"], previous["html"])
+        self.assertEqual(saved["last_fetch_error"], "Timeout")
+        self.assertEqual(entry["last_fetch_error"], "Timeout")
+        self.assertIn("readable", entry)
+        empty_result = fetch.save_fetch_failure(
+            attempted, "Seite ohne lesbaren Text", readable=False, status="empty")
+        self.assertEqual(empty_result["status"], "empty")
+        self.assertEqual(ev.load_page(previous["url"])["html"], previous["html"])
 
     def test_original_keeps_html(self):
         ev.save_page(self._record())
@@ -575,6 +617,76 @@ class CorpusTests(unittest.TestCase):
         self.assertEqual(ev.load_index(), {})
 
 
+class CorpusStageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self._pages, self._index = ev.PAGES_DIR, ev.PAGES_INDEX
+        ev.PAGES_DIR, ev.PAGES_INDEX = self.dir / "pages", self.dir / "pages" / "index.json"
+        self.sources = self.dir / "sources.csv"
+        self.sources.write_text("orga,orga_id,url\n", encoding="utf-8")
+        self.discovery = self.dir / "discovery.json"
+        self.discovery.write_text('{"events":[]}', encoding="utf-8")
+
+    def tearDown(self):
+        ev.PAGES_DIR, ev.PAGES_INDEX = self._pages, self._index
+        self.tmp.cleanup()
+
+    def _save(self, url, kind, markdown):
+        record = ev.new_page_record(url, kind, "Orga", "orga-id")
+        record.update(status="ok", markdown=markdown, text=markdown, html="<p>Text</p>")
+        ev.save_page(record)
+
+    def test_success_prunes_stale_same_kind_and_preserves_other_kind(self):
+        overview_url = "https://a.org/overview"
+        stale_overview = "https://a.org/old-overview"
+        detail_url = "https://a.org/event"
+        self._save(overview_url, "overview", "Old overview")
+        self._save(stale_overview, "overview", "Stale overview")
+        self._save(detail_url, "detail", "Keep detail")
+
+        with fetch.CorpusStage() as staged:
+            updated = ev.load_page(overview_url)
+            updated["markdown"] = "Fresh overview"
+            ev.save_page(updated)
+            removed = staged.prune_kind("overview", {overview_url})
+            self.assertEqual(removed, 1)
+            staged.publish(True, self.sources, self.discovery)
+
+        self.assertEqual(ev.load_page(overview_url)["markdown"], "Fresh overview")
+        self.assertIsNone(ev.load_page(stale_overview))
+        self.assertEqual(ev.load_page(detail_url)["markdown"], "Keep detail")
+        index = ev.load_index()
+        self.assertEqual(set(index), {overview_url, detail_url})
+        mirror_files = list(ev.readable_dir().rglob("*.json"))
+        self.assertEqual(len(mirror_files), 2)
+
+    def test_unpublished_stage_rolls_back_all_writes(self):
+        url = "https://a.org/overview"
+        self._save(url, "overview", "Original")
+
+        with fetch.CorpusStage():
+            changed = ev.load_page(url)
+            changed["markdown"] = "Uncommitted"
+            ev.save_page(changed)
+            self._save("https://a.org/new", "overview", "Uncommitted page")
+
+        self.assertEqual(ev.load_page(url)["markdown"], "Original")
+        self.assertIsNone(ev.load_page("https://a.org/new"))
+        self.assertEqual(set(ev.load_index()), {url})
+
+    def test_success_without_pruning_keeps_non_target_pages(self):
+        old_url = "https://a.org/old-event"
+        self._save(old_url, "detail", "Keep during partial run")
+
+        with fetch.CorpusStage() as staged:
+            self._save("https://a.org/new-event", "detail", "New event")
+            staged.publish(True, self.sources, self.discovery)
+
+        self.assertIsNotNone(ev.load_page(old_url))
+        self.assertIsNotNone(ev.load_page("https://a.org/new-event"))
+
+
 class EventTextTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -591,21 +703,38 @@ class EventTextTests(unittest.TestCase):
         record.update(status=status, markdown=markdown)
         ev.save_page(record)
 
-    def test_content_markdown_preferred_over_markdown(self):
+    def test_markdown_preferred_over_content_markdown(self):
         record = ev.new_page_record("https://a.org/e1", "detail")
         record.update(status="ok", markdown="NAV VOLLTEXT",
                       content_markdown="BEREINIGT")
         ev.save_page(record)
         self.assertEqual(ev.page_text(ev.load_page("https://a.org/e1")),
-                         "BEREINIGT")
+                         "NAV VOLLTEXT")
 
-    def test_markdown_fallback_for_old_corpus_entries(self):
+    def test_content_markdown_not_used_when_markdown_is_empty(self):
         record = ev.new_page_record("https://a.org/e2", "detail")
-        record.update(status="ok", markdown="ALTER VOLLTEXT")
-        del record["content_markdown"]
+        record.update(status="ok", content_markdown="ALT CLEANED TEXT",
+                      text="ALT PLAINTEXT")
         ev.save_page(record)
         self.assertEqual(ev.page_text(ev.load_page("https://a.org/e2")),
-                         "ALTER VOLLTEXT")
+                         "")
+
+    def test_content_source_selects_content_markdown(self):
+        record = ev.new_page_record("https://a.org/e3", "detail")
+        record.update(status="ok", markdown="NAV VOLLTEXT",
+                      content_markdown="BEREINIGT")
+        ev.save_page(record)
+        page = ev.load_page("https://a.org/e3")
+        self.assertEqual(ev.page_text(page, "content"), "BEREINIGT")
+        text, source = ev.event_text(
+            {"event_url": "https://a.org/e3", "source_url": ""}, "content")
+        self.assertEqual((text, source), ("BEREINIGT", "detail"))
+
+    def test_content_source_has_no_silent_fallback_to_raw(self):
+        self._seed("https://a.org/e4", "NUR ROH")
+        text, source = ev.event_text(
+            {"event_url": "https://a.org/e4", "source_url": ""}, "content")
+        self.assertEqual((text, source), ("", "none"))
 
     def test_detail_preferred_over_overview(self):
         self._seed("https://a.org/e1", "DETAILTEXT")
@@ -625,6 +754,24 @@ class EventTextTests(unittest.TestCase):
         self.assertEqual(source, "overview_cut")
         self.assertIn("Nur hier.", text)
         self.assertNotIn("weg", text)
+
+    def test_inline_event_date_before_title_keeps_its_own_section(self):
+        self._seed(
+            "https://a.org/t",
+            "Heute, 18:45\n## Linkswende kennenlernen\nBeschreibung eins.\n"
+            "Morgen, 12:00\n## Schulstreik\nBeschreibung zwei.",
+        )
+        text, source = ev.event_text({
+            "event_url": "",
+            "source_url": "https://a.org/t",
+            "listed_date_text": "Heute, 18:45",
+            "title": "Linkswende kennenlernen",
+        })
+        self.assertEqual(source, "overview_cut")
+        self.assertIn("Linkswende kennenlernen", text)
+        self.assertIn("Beschreibung eins.", text)
+        self.assertNotIn("Morgen, 12:00", text)
+        self.assertNotIn("Schulstreik", text)
 
     def test_missing_detail_page_falls_back_to_overview(self):
         self._seed("https://a.org/t", "UEBERSICHTSTEXT")
@@ -679,11 +826,95 @@ class DiscoverTests(unittest.TestCase):
         out = discover.normalize_event("https://a.org/", {"title": "T", "url": "javascript:x", "listed_date_text": ""})
         self.assertEqual(out["event_url"], "")
 
+    def test_normalize_event_requires_url_in_source_links(self):
+        links = [{"href": "https://a.org/events/known", "text": "T"}]
+        accepted = discover.normalize_event(
+            "https://a.org/", {"title": "T", "url": "/events/known"}, links)
+        rejected = discover.normalize_event(
+            "https://a.org/", {"title": "T", "url": "/events/invented"}, links)
+        self.assertEqual(accepted["event_url"], "https://a.org/events/known")
+        self.assertEqual(rejected["event_url"], "")
+
+    def test_normalize_event_drops_monthly_archive_pages(self):
+        for title in ("Monatsprogramm 09/2026", "Monatsprogramm 08/26",
+                      "Monatsprogramm 07/2026", "Monatsprogramm März 2026"):
+            with self.subTest(title=title):
+                self.assertIsNone(discover.normalize_event(
+                    "https://a.org/", {"title": title, "url": "/archive"}))
+        self.assertIsNotNone(discover.normalize_event(
+            "https://a.org/", {"title": "Herbstfest 2026", "url": "/herbstfest"}))
+
     def test_dedupe_collapses_title_url_pairs(self):
         events = [{"title": "A", "event_url": "u", "listed_date_text": ""},
                   {"title": "a", "event_url": "u", "listed_date_text": ""},
                   {"title": "A", "event_url": "v", "listed_date_text": ""}]
         self.assertEqual(len(discover.dedupe(events)), 2)
+
+
+class FetchTargetTests(unittest.TestCase):
+    TARGETS = [
+        {"url": "https://a.org/overview", "kind": "overview"},
+        {"url": "https://a.org/event", "kind": "detail"},
+    ]
+
+    def test_run_config_excludes_observed_consent_ui(self):
+        config = fetch.build_run_config(0, 0, 1000)
+        self.assertIn(".jelka-consent", config.excluded_selector)
+        self.assertIn("#cmplz-cookiebanner-container", config.excluded_selector)
+        self.assertIn(".cky-consent-container", config.excluded_selector)
+
+    def test_consent_ui_removed_before_markdown_without_losing_page_content(self):
+        from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
+        from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+
+        html = """
+        <html><body>
+          <section class="jelka-consent">Cookie consent notice</section>
+          <main>
+            <h1>Event title</h1>
+            <p>The event discusses cookie laws.</p>
+          </main>
+        </body></html>
+        """
+        config = fetch.build_run_config(0, 0, 1000)
+        scraped = LXMLWebScrapingStrategy().scrap(
+            "https://example.org/events",
+            html,
+            excluded_selector=config.excluded_selector,
+            word_count_threshold=config.word_count_threshold,
+        )
+        markdown = DefaultMarkdownGenerator().generate_markdown(
+            scraped.cleaned_html
+        ).raw_markdown
+
+        self.assertNotIn("Cookie consent notice", markdown)
+        self.assertIn("Event title", markdown)
+        self.assertIn("The event discusses cookie laws.", markdown)
+
+    def test_regular_run_reloads_every_target(self):
+        original = ev.load_index
+        ev.load_index = lambda: {
+            "https://a.org/overview": {"status": "ok"},
+            "https://a.org/event": {"status": "ok"},
+        }
+        try:
+            self.assertEqual(fetch.targets_to_fetch(self.TARGETS, retry_failed=False),
+                             self.TARGETS)
+        finally:
+            ev.load_index = original
+
+    def test_retry_failed_only_selects_missing_or_failed_targets(self):
+        original = ev.load_index
+        ev.load_index = lambda: {
+            "https://a.org/overview": {"status": "ok"},
+            "https://a.org/event": {"status": "ok", "last_fetch_error": "Timeout"},
+        }
+        try:
+            self.assertEqual(fetch.targets_to_fetch(self.TARGETS, retry_failed=True),
+                             [self.TARGETS[1]])
+        finally:
+            ev.load_index = original
+
 
 class ApiGateTests(unittest.TestCase):
     FLAT = "  a \n b \t c "
@@ -953,70 +1184,39 @@ class PluralParserTests(unittest.TestCase):
 
 
 class BasisAttachTests(unittest.TestCase):
-    SOURCE = "Am 23.08.2026 Konzert im Depot, Breite Gasse 3, 1070 Wien. Beginn 20:00."
     FIELDS = ("title", "start_date", "start_time")
-    EVIDENCE = {"start_date": "evidence_start_date", "start_time": "evidence_start_time"}
 
-    def _attach(self, data, source=None):
+    def _attach(self, data):
         target = {}
-        errors = basis.attach(target, data, [], self.FIELDS, self.EVIDENCE,
-                              source or self.SOURCE, "identity")
+        errors = basis.attach(target, data, [], self.FIELDS, "identity")
         return target, errors
 
-    def test_german_date_with_source_form_evidence_survives(self):
-        """DerRegressionfall: ISO-Wert, Beleg in deutscher Schreibweise."""
-        target, errors = self._attach({
-            "title": "Konzert", "start_date": "2026-08-23", "start_time": "20:00",
-            "evidence_start_date": "Am 23.08.2026", "evidence_start_time": "20:00",
-        })
+    def test_values_taken_without_quote(self):
+        target, errors = self._attach(
+            {"title": "Konzert", "start_date": "2026-08-23", "start_time": "20:00"})
         self.assertEqual(errors, [])
+        self.assertEqual(target["title"], "Konzert")
         self.assertEqual(target["start_date"], "2026-08-23")
-        self.assertEqual(target["confidence_start_date"], "high")
+        self.assertEqual(target["start_time"], "20:00")
 
-    def test_iso_echoed_as_evidence_no_longer_breaks_field(self):
-        target, _ = self._attach({
-            "title": "Konzert", "start_date": "2026-08-23", "start_time": "",
-            "evidence_start_date": "2026-08-23", "evidence_start_time": "",
-        })
-        self.assertEqual(target["start_date"], "")
-        self.assertEqual(target["confidence_start_date"], "none")
+    def test_german_date_is_normalised(self):
+        target, _ = self._attach({"title": "K", "start_date": "Do 08.10.", "start_time": "20.00"})
+        self.assertEqual(target["start_date"], f"{ev.current_date().year}-10-08")
+        self.assertEqual(target["start_time"], "20:00")
 
-    def test_title_must_appear_verbatim(self):
-        target, errors = self._attach({
-            "title": "ERFUNDENER TITEL", "start_date": "", "start_time": "",
-            "evidence_start_date": "", "evidence_start_time": "",
-        })
-        self.assertEqual(target["title"], "")
-        self.assertTrue(any("title" in e for e in errors))
-
-    def test_title_verbatim_accepted(self):
-        target, errors = self._attach({
-            "title": "Konzert im Depot", "start_date": "", "start_time": "",
-            "evidence_start_date": "", "evidence_start_time": "",
-        })
-        self.assertEqual(target["title"], "Konzert im Depot")
-        self.assertEqual(errors, [])
-
-    def test_disagreeing_date_evidence_clears_field(self):
-        target, errors = self._attach({
-            "title": "Konzert", "start_date": "2026-12-31", "start_time": "",
-            "evidence_start_date": "23.08.2026", "evidence_start_time": "",
-        })
+    def test_unreadable_date_cleared_with_error(self):
+        target, errors = self._attach({"title": "K", "start_date": "bald", "start_time": ""})
         self.assertEqual(target["start_date"], "")
         self.assertTrue(any("start_date" in e for e in errors))
 
     def test_empty_value_is_none_not_error(self):
-        target, errors = self._attach({
-            "title": "", "start_date": "", "start_time": "",
-            "evidence_start_date": "", "evidence_start_time": "",
-        })
+        target, errors = self._attach({"title": "", "start_date": "", "start_time": ""})
         self.assertEqual(errors, [])
         self.assertEqual(target["confidence_title"], "none")
 
     def test_no_answer_marks_all_none(self):
         target = {}
-        errors = basis.attach(target, None, ["Timeout"], self.FIELDS, self.EVIDENCE,
-                              self.SOURCE, "identity")
+        errors = basis.attach(target, None, ["Timeout"], self.FIELDS, "identity")
         self.assertEqual(errors, ["identity: Timeout"])
         self.assertEqual(target["confidence_start_time"], "none")
         self.assertEqual(target["title"], "")
@@ -1038,24 +1238,35 @@ class VenueApplyTests(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(record["venue_address"], "Breite Gasse 3, 1070 Wien")
         self.assertEqual(record["venue_confidence"], "high")
-        self.assertEqual(record["confidence_venue_address"], "high")
+        self.assertEqual(record["confidence_venue_address"], "llm")
 
-    def test_partial_address_rejected(self):
+    def test_address_source_kept_only_with_address(self):
+        record, _ = self._venue({
+            "address": "Breite Gasse 3, 1070 Wien", "address_source": "inferred",
+            "venue_name": "Depot", "confidence": "high",
+        })
+        self.assertEqual(record["venue_address_source"], "inferred")
+        record, _ = self._venue({
+            "address": "", "address_source": "inferred",
+            "venue_name": "Depot", "confidence": "venue_only",
+        }, source="Im Depot")
+        self.assertEqual(record["venue_address_source"], "")
+
+    def test_partial_address_kept_and_noted(self):
         record, problems = self._venue({
             "address": "Breite Gasse", "venue_name": "",
             "confidence": "high",
         })
-        self.assertEqual(record["venue_address"], "")
-        self.assertEqual(record["venue_confidence"], "none")
+        self.assertEqual(record["venue_address"], "Breite Gasse")
         self.assertTrue(any("volle Anschrift" in p for p in problems))
 
-    def test_invented_address_rejected(self):
+    def test_address_not_in_source_is_kept(self):
         record, problems = self._venue({
             "address": "Falkengasse 9, 1020 Wien", "venue_name": "",
             "confidence": "high",
         })
-        self.assertEqual(record["venue_address"], "")
-        self.assertTrue(any("nicht im Quelltext" in p for p in problems))
+        self.assertEqual(record["venue_address"], "Falkengasse 9, 1020 Wien")
+        self.assertEqual(problems, [])
 
     def test_venue_name_only(self):
         record, _ = self._venue({
@@ -1084,12 +1295,6 @@ class VenueApplyTests(unittest.TestCase):
         self.assertEqual(record["venue_confidence"], "none")
         self.assertEqual(record["confidence_venue_name"], "none")
         self.assertEqual(problems, ["venue: Timeout"])
-
-    def test_room_name_does_not_make_an_address(self):
-        record, _ = self._venue({
-            "address": "Alois Wagner-Saal", "venue_name": "", "confidence": "high",
-        }, source="Saal: Alois Wagner-Saal, Sensengasse 3, 1090 Wien")
-        self.assertEqual(record["venue_address"], "")
 
 
 class EventUrlReconcileTests(unittest.TestCase):
@@ -1132,11 +1337,12 @@ class EventUrlReconcileTests(unittest.TestCase):
 
 
 class VenueGateTests(unittest.TestCase):
-    def test_gate_only_positive_nicht_wien(self):
+    def test_gate_wien_ausschluss_review(self):
         for address, expected in (
             ("Breite Gasse 3, 1070 Wien", (True, "")),
             ("Hauptplatz 3, 3500 Krems", (False, "outside_vienna")),
-            ("", (True, "")),
+            ("", (False, "needs_review")),
+            ("Parkplatz Bahnhof", (False, "needs_review")),
         ):
             self.assertEqual(basis.run_vienna_gate({"venue_address": address}), expected)
 

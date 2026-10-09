@@ -15,20 +15,20 @@ Zwei Entscheidungen absichtlich ausserhalb dieses Skripts und ausserhalb jedes
 LLMs:
 
 1. Die Gates sind determinisch. Ein LLM bringt hier nur Varianz, keine Info.
-2. Beide Gates schliessen NUR bei gesicherter Erkenntnis aus. Unklarheit führt
-   zu "durchlassen", nie zu "verworfen". Ein wegfallendes Event ist ein
-   Informationsverlust, der später nicht mehr sichtbar ist; ein zu viel
-   behaltenes Event ist eine Zeile mehr im Review.
+2. Past schliesst nur bei gesichertem Datum aus (unklar = durchlassen).
+   Wien lässt nur eine gesicherte Wiener Adresse durch: Nicht-Wien geht nach
+   basis-excluded.csv, alles Unklare (z. B. keine Adresse) nach
+   basis-review.csv zur manuellen Prüfung, nicht nach basis.json.
 
-Beweispflicht: jedes nicht-leere Feld braucht ein wörtliches Zitat aus dem
-Quelltext. Ein Zitat, das im Quelltext nicht vorkommt, ist halluziniert und
-leert das Feld. Das ist der Unterschied zwischen "das Modell hat geantwortet"
-und "das Modell hat belegt".
+Keine Zitatpflicht: das Modell entscheidet, Werte werden nur auf Format
+geprüft. Erschlossene Adressen sind mit venue_address_source = "inferred"
+markiert.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -41,63 +41,55 @@ from progress import Progress, load_or_start_run, record_step
 OUT_DISCOVERY = ev.OUT_DIR / "discovery.json"
 OUT_BASIS = ev.OUT_DIR / "basis.json"
 OUT_EXCLUDED = ev.OUT_DIR / "basis-excluded.csv"
+OUT_REVIEW = ev.OUT_DIR / "basis-review.csv"
 
 EXCLUDED_FIELDS = [
     "orga_id", "orga", "source_url", "event_url", "listed_title", "title",
-    "start_date", "venue_address", "venue_confidence", "exclusion_reason",
+    "start_date", "venue_address", "venue_address_source", "venue_confidence", "exclusion_reason",
     "excluded_at_stage", "listed_date_text", "note",
 ]
 
 
-IDENTITY_MODES = {
-    "title": ("verbatim", None),
-    "start_date": ("derived", ev.parse_de_dates),
-    "start_time": ("derived", ev.parse_de_times),
-}
-
-
 def attach(target: dict[str, Any], data: dict[str, Any] | None, errors: list[str],
-           fields: tuple[str, ...], evidence_map: dict[str, str],
-           source_text: str, prefix: str) -> list[str]:
-    """Werte übernehmen, Beweise prüfen, Konfidenz setzen. Gibt Fehler zurück.
+           fields: tuple[str, ...], prefix: str) -> list[str]:
+    """Werte des Modells übernehmen, nur Format prüfen. Gibt Fehler zurück.
 
-    Verbatim-Felder (Titel) müssen selbst im Quelltext stehen. Normalisierte
-    Felder (Datum, Zeit) werden über ihre Quellform belegt, weil der
-    normalisierte Wert per Definition nicht im Text stehen kann.
+    Keine Zitatpflicht: das Modell entscheidet. Datum wird auf ISO, Zeit auf
+    HH:MM gebracht; Unparsebares wird geleert. Fehlt das Jahr, gilt das
+    aktuelle Jahr.
     """
-    problems: list[str] = []
     if data is None:
         for field in fields:
             target[field] = ""
             target[f"confidence_{field}"] = "none"
         return [f"{prefix}: {'; '.join(errors)[:300]}"] if errors else [f"{prefix}: keine Antwort"]
+    problems: list[str] = []
+    year = str(ev.current_date().year)
     for field in fields:
         value = str(data.get(field) or "").strip()
-        quote = str(data.get(evidence_map.get(field, f"evidence_{field}") or "") or "").strip()
+        if field == "start_date" and value:
+            value = value if ev.iso_date(value) else ev.parse_de_date(value, year)
+        elif field == "start_time" and value:
+            value = value if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value) else ev.parse_de_time(value)
         if not value:
+            if str(data.get(field) or "").strip():
+                problems.append(f"{prefix}.{field}: Format nicht lesbar")
             target[field] = ""
             target[f"confidence_{field}"] = "none"
             continue
-        mode, parser = IDENTITY_MODES.get(field, ("verbatim", None))
-        if mode == "derived":
-            final, verdict = ev.resolve_derived(value, quote, source_text, parser)
-        else:
-            final, verdict = value, ("high" if ev.verify_evidence(value, source_text) else "none")
-        if verdict == "none":
-            target[field] = ""
-            target[f"confidence_{field}"] = "none"
-            problems.append(f"{prefix}.{field}: Beleg fehlt, nicht im Quelltext oder werterwidrig")
-            continue
-        target[field] = final
-        target[f"confidence_{field}"] = verdict
+        target[field] = value
+        target[f"confidence_{field}"] = "llm"
     return problems
 
 
 def run_vienna_gate(record: dict[str, Any]) -> tuple[bool, str]:
-    """Nur positives Nicht-Wien schliesst aus; unklar heisst durchlassen."""
+    """Nur gesichert Wien kommt durch. Nicht-Wien wird ausgeschlossen, Unklares
+    (z. B. keine Adresse) geht zur manuellen Prüfung in eine eigene Datei."""
     verdict = ev.is_vienna_address(record.get("venue_address", ""))
     if verdict is False:
         return False, "outside_vienna"
+    if verdict is None:
+        return False, "needs_review"
     return True, ""
 
 
@@ -130,6 +122,9 @@ def apply_venue(record: dict[str, Any], data: dict[str, Any] | None,
     Das Schema heisst die Felder address/venue_name, der Datensatz führt sie als
     venue_address/venue_name. Diese Übersetzung passiert ausschliesslich hier.
 
+    Keine Zitatpflicht: das Modell entscheidet. Eine unvollständige Anschrift
+    bleibt erhalten und wird nur vermerkt.
+
     Ein erklärtes "online" wird nur geglaubt, wenn sonst nichts gefunden wurde:
     ein Modell, das online behauptet und gleichzeitig eine Strasse zitiert, hat
     die Strasse gewonnen.
@@ -138,6 +133,7 @@ def apply_venue(record: dict[str, Any], data: dict[str, Any] | None,
     if data is None:
         record["venue_address"] = ""
         record["venue_name"] = ""
+        record["venue_address_source"] = ""
         record["venue_confidence"] = "none"
         record["confidence_venue_address"] = "none"
         record["confidence_venue_name"] = "none"
@@ -147,23 +143,17 @@ def apply_venue(record: dict[str, Any], data: dict[str, Any] | None,
     venue_name = " ".join(str(data.get("venue_name") or "").split()).strip()
     declared = str(data.get("confidence") or "").strip().lower()
 
-    # Adresse und Venue-Name sind Wörtlichfelder: sie müssen selbst im
-    # Quelltext stehen. Ein separates Zitatsfeld würde hier nur eine zweite
-    # Gelegenheit zum Erfinden geben.
-    address_ok = bool(address) and ev.verify_evidence(address, source_text)
-    name_ok = bool(venue_name) and ev.verify_evidence(venue_name, source_text)
-    if address and not address_ok:
-        problems.append("venue.address: nicht im Quelltext")
-    if venue_name and not name_ok:
-        problems.append("venue.venue_name: nicht im Quelltext")
+    address_ok = bool(address)
+    name_ok = bool(venue_name)
     if address_ok and not ev.is_full_address(address):
         problems.append("venue.address: keine volle Anschrift (Straße+Nr+PLZ+Ort)")
-        address, address_ok = "", False
 
-    record["venue_address"] = address if address_ok else ""
-    record["venue_name"] = venue_name if name_ok else ""
-    record["confidence_venue_address"] = "high" if address_ok else "none"
-    record["confidence_venue_name"] = "high" if name_ok else "none"
+    source = str(data.get("address_source") or "").strip().lower()
+    record["venue_address"] = address
+    record["venue_address_source"] = source if address and source in {"page", "inferred"} else ""
+    record["venue_name"] = venue_name
+    record["confidence_venue_address"] = "llm" if address_ok else "none"
+    record["confidence_venue_name"] = "llm" if name_ok else "none"
     if address_ok:
         record["venue_confidence"] = "high"
     elif name_ok:
@@ -196,34 +186,34 @@ async def extract_one(
         "start_time": "",
         "venue_address": "",
         "venue_name": "",
+        "venue_address_source": "",
         "venue_confidence": "none",
         "field_errors": [],
     }
     llm_kwargs = {"tracker": tracker} if tracker is not None else {}
 
-    text, source = ev.event_text(event)
+    text, source = ev.event_text(event, cfg["text_source"])
     record["text_source"] = source
     if not text:
         record["field_errors"].append("text: kein Quelltext im Corpus")
         return record
 
     identity_fields = ("title", "start_date", "start_time")
-    identity_evidence = {"start_date": "evidence_start_date",
-                         "start_time": "evidence_start_time"}
     identity_payload = {
         "event_title_hint": event.get("title", ""),
         "listed_date_text": event.get("listed_date_text", ""),
         "event_url": event.get("event_url", ""),
         "orga": event.get("orga", ""),
         "source_url": event.get("source_url", ""),
+        "jsonld_hint": ev.jsonld_hint_for(event) if cfg["jsonld"] else "",
+        "default_year": str(ev.current_date().year),
         "source_text": text,
     }
     data, errors = await ev.llm_json(
         client, cfg["identity"], cfg["prompts"]["identity"], identity_payload, semaphore,
         schema=cfg["schemas"]["identity"], max_tokens=cfg["max_tokens"], **llm_kwargs,
     )
-    record["field_errors"].extend(attach(record, data, errors, identity_fields,
-                                         identity_evidence, text, "identity"))
+    record["field_errors"].extend(attach(record, data, errors, identity_fields, "identity"))
     if data is not None:
         record["field_errors"].extend(reconcile_event_url(
             record, str(event.get("event_url") or ""), str(data.get("event_url") or "")))
@@ -232,7 +222,7 @@ async def extract_one(
     # Seite (Discovery-Irrtum). Einmal mit Übersichtstext neu versuchen, statt
     # das Event aufgrund einer fremden Seite zu verlieren.
     if source == "detail" and not record.get("title") and not record.get("start_date"):
-        fallback, fallback_source = ev.event_text({**event, "event_url": ""})
+        fallback, fallback_source = ev.event_text({**event, "event_url": ""}, cfg["text_source"])
         if fallback and fallback != text:
             fdata, ferr = await ev.llm_json(
                 client, cfg["identity"], cfg["prompts"]["identity"],
@@ -240,8 +230,7 @@ async def extract_one(
                 schema=cfg["schemas"]["identity"], max_tokens=cfg["max_tokens"], **llm_kwargs,
             )
             trial: dict[str, Any] = {}
-            trial_errors = attach(trial, fdata, ferr, identity_fields,
-                                  identity_evidence, fallback, "identity")
+            trial_errors = attach(trial, fdata, ferr, identity_fields, "identity")
             if trial.get("title") or trial.get("start_date"):
                 for field in identity_fields:
                     record[field] = trial[field]
@@ -292,12 +281,19 @@ async def run(args: argparse.Namespace) -> int:
         print(f"Keine Events in {args.discovery}", flush=True)
         return 1
 
+    text_source = args.text_source or str(
+        ev.load_input_config().get("basis_text_source") or "raw")
+    if text_source not in ev.TEXT_SOURCES:
+        print(f"Unbekannte Textquelle: {text_source} (raw|content)", flush=True)
+        return 1
+
     cfg = {
         "identity": ev.model_for("IDENTITY", args.model_identity),
         "venue": ev.model_for("VENUE", args.model_venue),
         "prompts": {name: ev.load_prompt(name) for name in ("identity", "venue")},
         "schemas": {name: ev.load_schema(name) for name in ("identity", "venue")},
         "jsonld": not args.no_jsonld,
+        "text_source": text_source,
         "max_tokens": args.max_tokens,
     }
     for role in ("identity", "venue"):
@@ -311,10 +307,11 @@ async def run(args: argparse.Namespace) -> int:
     semaphore = asyncio.Semaphore(max(1, args.jobs))
     client = ClientRouter()
     tracker = UsageTracker()
-    print(f"Basis: {len(events)} Events | identity={cfg['identity']} venue={cfg['venue']}", flush=True)
+    print(f"Basis: {len(events)} Events | text={text_source} identity={cfg['identity']} venue={cfg['venue']}", flush=True)
 
     kept: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
+    review: list[dict[str, Any]] = []
     done = 0
     progress = Progress("Basis", len(events), state["started_at"], parallelism=args.jobs)
 
@@ -326,7 +323,8 @@ async def run(args: argparse.Namespace) -> int:
         except Exception as exc:
             record = {**event, "field_errors": [f"{type(exc).__name__}: {exc}"],
                       "text_source": "error"}
-        (excluded if record.get("exclusion_reason") else kept).append(record)
+        reason = record.get("exclusion_reason")
+        (review if reason == "needs_review" else excluded if reason else kept).append(record)
         done += 1
         progress.update(done, time.monotonic() - unit_started)
 
@@ -338,10 +336,12 @@ async def run(args: argparse.Namespace) -> int:
         "generated_at": ev.now_iso(),
         "models": {"identity": cfg["identity"], "venue": cfg["venue"]},
         "jsonld_hint": cfg["jsonld"],
+        "text_source_mode": cfg["text_source"],
         "events": kept,
     }
     ev.write_json(Path(args.output), payload)
     ev.write_csv(Path(args.excluded), EXCLUDED_FIELDS, excluded)
+    ev.write_csv(Path(args.review), EXCLUDED_FIELDS, review)
     record_usage(state, tracker)
     record_step(state, "basis", time.monotonic() - started)
 
@@ -355,13 +355,13 @@ async def run(args: argparse.Namespace) -> int:
         venues[key] = venues.get(key, 0) + 1
     errored = sum(1 for record in kept if record.get("field_errors"))
 
-    print(f"Basis fertig: {len(kept)} behalten, {len(excluded)} ausgeschlossen", flush=True)
+    print(f"Basis fertig: {len(kept)} behalten, {len(excluded)} ausgeschlossen, {len(review)} zur Prüfung", flush=True)
     if reasons:
         print("Ausschluss: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items())), flush=True)
     print("Venue: " + ", ".join(f"{k} {v}" for k, v in sorted(venues.items())), flush=True)
     print(f"Mit Feldfehlern: {errored}", flush=True)
     print(tracker.render("Basis LLM-Nutzung"), flush=True)
-    print(f"-> {args.output}\n-> {args.excluded}", flush=True)
+    print(f"-> {args.output}\n-> {args.excluded}\n-> {args.review}", flush=True)
     return 0
 
 
@@ -370,11 +370,15 @@ def main() -> None:
     parser.add_argument("--discovery", default=str(OUT_DISCOVERY))
     parser.add_argument("--output", default=str(OUT_BASIS))
     parser.add_argument("--excluded", default=str(OUT_EXCLUDED))
+    parser.add_argument("--review", default=str(OUT_REVIEW))
     parser.add_argument("--model-identity", default=None)
     parser.add_argument("--model-venue", default=None)
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=2000)
+    parser.add_argument("--text-source", choices=sorted(ev.TEXT_SOURCES), default=None,
+                        help="Eingabetext: raw (markdown) oder content (content_markdown); "
+                             "Default aus config/input.json")
     parser.add_argument("--no-jsonld", action="store_true",
                         help="JSON-LD-Hinweis nicht in den Venue-Prompt geben")
     args = parser.parse_args()
