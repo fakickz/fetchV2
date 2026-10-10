@@ -21,6 +21,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/crawl4ai-setup   # Browser für den Crawler
 cp .env.example .env       # Keys eintragen
+cp INPUT/sources.example.csv INPUT/sources.csv
 ```
 
 ## Lauf
@@ -69,3 +70,5 @@ npm test       # reine Funktionstests, kein Netz, kein LLM
 - `api_gate` erkennt API-Quellen (Tribe/gcal) und prüft ihre Erreichbarkeit.
   Die Event-Discovery ignoriert API-Daten vorerst und arbeitet mit den
   gecrawlten HTML-Seiten.
+- `INPUT/sources.csv` und `offene-todos` sind lokale Arbeitsdateien (nicht im
+  Repo). Nutze `INPUT/sources.example.csv` als Startpunkt für deine Quellen.
