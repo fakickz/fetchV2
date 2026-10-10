@@ -415,19 +415,20 @@ async def run(args: argparse.Namespace) -> int:
             await asyncio.gather(*(worker(target) for target in pending))
 
         complete = counts.get("error", 0) == 0 and counts.get("empty", 0) == 0
-        if complete:
-            full_run = args.limit == 0 and not args.retry_failed
-            if full_run:
-                keep_urls = {ev.norm_url(target["url"]) for target in targets}
-                kind = "overview" if args.mode == "overviews" else "detail"
-                removed = staged.prune_kind(kind, keep_urls)
-                if removed:
-                    print(f"Veraltete {kind}-Seiten entfernt: {removed}", flush=True)
-            staged.publish(
-                update_readable=not args.no_readable,
-                sources_path=Path(args.input),
-                discovery_path=Path(args.urls_from),
-            )
+        full_run = args.limit == 0 and not args.retry_failed
+        if complete and full_run:
+            keep_urls = {ev.norm_url(target["url"]) for target in targets}
+            kind = "overview" if args.mode == "overviews" else "detail"
+            removed = staged.prune_kind(kind, keep_urls)
+            if removed:
+                print(f"Veraltete {kind}-Seiten entfernt: {removed}", flush=True)
+        # Einzelne Fehlschläge verwerfen den Lauf nicht: save_fetch_failure
+        # behält pro Seite den letzten guten Stand.
+        staged.publish(
+            update_readable=not args.no_readable,
+            sources_path=Path(args.input),
+            discovery_path=Path(args.urls_from),
+        )
 
     tracker.finish()
     record_step(state, f"fetch_{args.mode}", time.monotonic() - started)
@@ -435,7 +436,7 @@ async def run(args: argparse.Namespace) -> int:
           f"/ Fehler {counts.get('error', 0)}", flush=True)
     if not complete:
         print("Fehlgeschlagene Abrufe können mit --retry-failed erneut geholt werden; "
-              "der bisherige Corpus bleibt unverändert.", flush=True)
+              "übrige Seiten sind bereits im Corpus.", flush=True)
     if not args.no_readable:
         run_summary(targets, ev.load_index())
         print(f"Spiegel: {ev.readable_dir()}", flush=True)
