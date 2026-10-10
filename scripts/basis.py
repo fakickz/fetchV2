@@ -45,8 +45,9 @@ OUT_REVIEW = ev.OUT_DIR / "basis-review.csv"
 
 EXCLUDED_FIELDS = [
     "orga_id", "orga", "source_url", "event_url", "listed_title", "title",
-    "start_date", "venue_address", "venue_address_source", "venue_confidence", "exclusion_reason",
-    "excluded_at_stage", "listed_date_text", "note",
+    "start_date", "start_time", "listed_date_text",
+    "venue_name", "venue_address", "venue_address_source", "venue_confidence",
+    "exclusion_reason", "excluded_at_stage", "text_source", "field_errors", "note",
 ]
 
 
