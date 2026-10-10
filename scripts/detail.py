@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """detail: Feininformationen für die von basis behaltenen Events.
 
-Liest ausschliesslich out/basis.json, ruft nie Webseiten auf und liest denselben
+Liest ausschliesslich OUTPUT/basis.json, ruft nie Webseiten auf und liest denselben
 Corpus wie basis. Die Prompts laufen parallel pro Event; jedes Feld hat ein
 eigenes Prompt, ein eigenes Schema und die gleiche Beweispflicht.
 

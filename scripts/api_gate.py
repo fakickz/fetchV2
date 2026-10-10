@@ -2,7 +2,7 @@
 """api_gate: API-Quellen erkennen, prüfen, taggen. Deterministisch, kein LLM.
 
 Läuft zwischen fetch --mode overviews und discover. Liest NUR den Corpus
-(kein Crawl) und schreibt out/api_sources.json: pro Quelle entweder ein
+(kein Crawl) und schreibt OUTPUT/api_sources.json: pro Quelle entweder ein
 nutzbares api_source-Objekt oder nichts.
 
 Zwei Wege zur Config:

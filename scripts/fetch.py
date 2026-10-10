@@ -7,13 +7,13 @@ Modelle beliebig oft neu ausprobiert werden können, ohne erneut zu crawlen.
 
 Modi:
   --mode overviews   INPUT/sources.csv  -> Übersichtsseiten, kind=overview
-  --mode urls        out/discovery.json -> Event-Detailseiten, kind=detail
+  --mode urls        OUTPUT/discovery.json -> Event-Detailseiten, kind=detail
 
-Speicherform: eine Datei pro Seite unter out/pages/<hash>.json plus index.json.
+Speicherform: eine Datei pro Seite unter OUTPUT/corpus/<hash>.json plus index.json.
 Einzelne Dateien statt eines Blobs erlauben selektiertes Nachladen, sicheres
 paralleles Schreiben und --retry-failed ohne Restschaden.
 
-Zusätzlich schreibt jeder Lauf ein lesbare Spiegel unter out/pages_readable/,
+Zusätzlich schreibt jeder Lauf ein lesbare Spiegel unter OUTPUT/corpus_readable/,
 gruppiert nach Organisation und mit URL-Segmente statt Hash als Dateinamen.
 Das Spiegel ist abgeleitet und nie autoritativ: gesucht, gelesen und referenziert
 wird ausschliesslich der Hash-Corpus.
@@ -64,8 +64,8 @@ class CorpusStage:
     def __enter__(self) -> "CorpusStage":
         self.root = Path(tempfile.mkdtemp(
             prefix=".fetch-corpus-", dir=self.pages_dir.parent))
-        self.stage_pages = self.root / "pages"
-        self.stage_readable = self.root / "pages_readable"
+        self.stage_pages = self.root / "corpus"
+        self.stage_readable = self.root / "corpus_readable"
         try:
             if self.pages_dir.exists():
                 shutil.copytree(self.pages_dir, self.stage_pages)
@@ -108,8 +108,8 @@ class CorpusStage:
         if update_readable:
             rebuild_readable(sources_path, discovery_path)
 
-        backup_pages = self.root / "pages.previous"
-        backup_readable = self.root / "pages_readable.previous"
+        backup_pages = self.root / "corpus.previous"
+        backup_readable = self.root / "corpus_readable.previous"
         moved_pages = moved_readable = installed_pages = installed_readable = False
         try:
             if self.pages_dir.exists():

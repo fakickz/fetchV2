@@ -19,7 +19,7 @@ def load_script(name: str, relative_path: str):
     Co. importieren eventlib normal per Namen. Ohne den Eintrag bekäme jedes
     Skript eine zweite eventlib-Instanz mit unpatched Pfadkonstanten, und ein
     Test, der PAGES_DIR ins Temp-Verzeichnis biegt, schreibt still ins echte
-    out/pages.
+    OUTPUT/corpus.
     """
     spec = importlib.util.spec_from_file_location(name, ROOT / relative_path)
     if spec is None or spec.loader is None:

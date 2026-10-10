@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-RUN_STATE_PATH = ROOT / "out" / ".pipeline-progress.json"
+RUN_STATE_PATH = ROOT / "OUTPUT" / ".pipeline-progress.json"
 _T80 = (0, 3.078, 1.886, 1.638, 1.533, 1.476, 1.440, 1.415, 1.397, 1.383)
 
 

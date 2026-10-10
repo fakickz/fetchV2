@@ -2,12 +2,12 @@
 
 ```
 INPUT/sources.csv
-→ fetch --mode overviews   -> out/pages/ + out/pages_readable/
-→ api-gate                 -> out/api_sources.json
-→ discover                 -> out/discovery.json
-→ fetch --mode urls        -> out/pages/ (Detailseiten)
-→ basis                    -> out/basis.json + out/basis-excluded.csv + out/basis-review.csv
-→ detail                   -> out/detail.json
+→ fetch --mode overviews   -> OUTPUT/corpus/ + OUTPUT/corpus_readable/
+→ api-gate                 -> OUTPUT/api_sources.json
+→ discover                 -> OUTPUT/discovery.json
+→ fetch --mode urls        -> OUTPUT/corpus/ (Detailseiten)
+→ basis                    -> OUTPUT/basis.json + OUTPUT/basis-excluded.csv + OUTPUT/basis-review.csv
+→ detail                   -> OUTPUT/detail.json
 ```
 
 ## Setup
@@ -33,7 +33,7 @@ npm test       # reine Funktionstests, kein Netz, kein LLM
 
 - Fetch crawlt nur (kein LLM, kein Urteil). Bei jedem normalen Lauf werden
   alle ausgewählten Overview- und Detailziele frisch gecrawlt; der aktuelle
-  Corpus liegt unter `out/pages/`. Bereits vorhandene gute Corpusdaten bleiben
+  Corpus liegt unter `OUTPUT/corpus/`. Bereits vorhandene gute Corpusdaten bleiben
   bei einem fehlgeschlagenen erneuten Abruf erhalten.
 - Ein erfolgreicher vollständiger Fetch-Lauf ersetzt nur die Seiten derselben
   Art: alte Overviews werden nach einem Overview-Lauf entfernt; alte
@@ -57,7 +57,7 @@ npm test       # reine Funktionstests, kein Netz, kein LLM
 - Eingabetext von basis: `config/input.json` (`basis_text_source`: `raw` =
   `markdown`, `content` = DOM-bereinigtes `content_markdown`), überschreibbar
   mit `--text-source`. `npm run basis:raw` und `npm run basis:content` schreiben
-  getrennte Ausgaben (`out/basis-raw*`, `out/basis-content*`) für A/B-Vergleiche.
+  getrennte Ausgaben (`OUTPUT/basis-raw*`, `OUTPUT/basis-content*`) für A/B-Vergleiche.
   Kein stilles Fallback zwischen den Fassungen. discover bleibt auf `markdown`.
 - Identity (Titel, Datum, Startzeit) hat vorerst keine Zitatpflicht und keine
   Textlängenbegrenzung. Fehlendes Jahr gilt als aktuelles Jahr. JSON-LD geht

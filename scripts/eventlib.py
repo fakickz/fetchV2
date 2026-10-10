@@ -34,8 +34,8 @@ PROMPTS_DIR = ROOT / "prompts"
 CONFIG_DIR = ROOT / "config"
 SCHEMAS_DIR = ROOT / "schemas"
 INPUT_DIR = ROOT / "INPUT"
-OUT_DIR = ROOT / "out"
-PAGES_DIR = OUT_DIR / "pages"
+OUT_DIR = ROOT / "OUTPUT"
+PAGES_DIR = OUT_DIR / "corpus"
 PAGES_INDEX = PAGES_DIR / "index.json"
 DEFAULT_SOURCES = INPUT_DIR / "sources.csv"
 VIENNA = ZoneInfo("Europe/Vienna")
@@ -105,9 +105,9 @@ def readable_dir() -> Path:
 
     Ableitung statt Modulkonstante: Tests patchen PAGES_DIR und isolieren damit
     automatisch auch das Spiegel. Eine separate Konstante hätte still das echte
-    out/pages_readable verschmutzt.
+    OUTPUT/corpus_readable verschmutzt.
     """
-    return PAGES_DIR.parent / "pages_readable"
+    return PAGES_DIR.parent / "corpus_readable"
 
 
 def page_hash(url: str) -> str:
