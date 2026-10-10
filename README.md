@@ -10,6 +10,10 @@ INPUT/sources.csv
 → detail                   -> OUTPUT/detail.json
 ```
 
+`npm run crawl` = Phase 1 (fetch:overview, api-gate, discover, fetch:details),
+`npm run enrich` = Phase 2 (`basis` und danach `detail`; `npm run details` ist
+ein Alias für `detail`), `npm run v2` = beides.
+
 ## Setup
 
 ```sh
