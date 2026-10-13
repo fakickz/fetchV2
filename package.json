@@ -13,6 +13,7 @@
     "basis:raw": ".venv/bin/python scripts/basis.py --text-source raw --output OUTPUT/basis-raw.json --excluded OUTPUT/basis-raw-excluded.csv --review OUTPUT/basis-raw-review.csv",
     "basis:content": ".venv/bin/python scripts/basis.py --text-source content --output OUTPUT/basis-content.json --excluded OUTPUT/basis-content-excluded.csv --review OUTPUT/basis-content-review.csv",
     "detail": ".venv/bin/python scripts/detail.py",
+    "convert": ".venv/bin/python scripts/convert.py",
     "details": "npm run detail",
     "enrich": "npm run basis && npm run detail",
     "test": ".venv/bin/python -m unittest tests.test_pipeline_v2",
