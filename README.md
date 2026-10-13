@@ -31,6 +31,8 @@ npm run v2     # alles
 npm run crawl  # overviews -> api-gate -> discovery -> detailseiten
 npm run fetch:overview
 npm run fetch:details
+npm run enrich
+npm run convert
 npm test       # reine Funktionstests, kein Netz, kein LLM
 ```
 
